@@ -1427,6 +1427,14 @@ public class EmrService implements Resettable, StoredResourceArns {
             // which the step's thread makes, or the release's.
             String image = cluster.getBootstrapImage() != null ? cluster.getBootstrapImage() : imageTemplate;
             Supplier<String> releaseImage = cluster.getBootstrapImage() == null ? releaseImage(cluster) : null;
+            // Every EMR cluster runs HDFS on its primary node, which the step's thread starts when it is not running:
+            // a NameNode and a DataNode, in a container of the release's Hive image, the one with HDFS's daemons.
+            String clusterId = cluster.getId();
+            String hdfsHost = masterPrivateDnsName(cluster);
+            String hdfsImage = EmrServerlessSparkRunner.image(hiveImageTemplate, cluster.getReleaseLabel(),
+                    SparkJobRunner.Engine.HIVE);
+            Supplier<SparkJobRunner.Storage> hdfs = storage == null ? null
+                    : () -> clusterStorage.hdfs(clusterId, accountId, region, hdfsHost, hdfsImage, dockerNetwork);
             SparkJobRunner.Job job;
             if (hive != null) {
                 job = new SparkJobRunner.Job(SERVICE, step.getId(), accountId, region, cluster.getReleaseLabel(),
@@ -1453,7 +1461,7 @@ public class EmrService implements Resettable, StoredResourceArns {
             }
             StepLaunch launch = new StepLaunch(accountId, region, cluster.getId(), step.getId(), generation);
             executing.add(stepKey(accountId, step.getId()));
-            stepExecutor.execute(() -> runStep(job, launch, releaseImage));
+            stepExecutor.execute(() -> runStep(job, launch, releaseImage, hdfs));
         }
 
         @Override
@@ -1464,7 +1472,8 @@ public class EmrService implements Resettable, StoredResourceArns {
 
     // A step's thread: its driver runs to its end, or the step fails at once when Floci does not run its kind. A
     // cluster with Hive's image is made first, when it is not there yet, so a failure to make it fails the step.
-    private void runStep(SparkJobRunner.Job job, StepLaunch launch, Supplier<String> releaseImage) {
+    private void runStep(SparkJobRunner.Job job, StepLaunch launch, Supplier<String> releaseImage,
+                         Supplier<SparkJobRunner.Storage> hdfs) {
         String failure;
         if (job == null) {
             failure = EmrSparkSteps.NOT_RUN;
@@ -1474,10 +1483,11 @@ public class EmrService implements Resettable, StoredResourceArns {
             try {
                 SparkJobRunner.Job running = releaseImage != null && !progress.cancelled()
                         ? job.inImage(releaseImage.get()) : job;
-                // The cluster's storage is there before its first step's container mounts it. A step a cancel,
-                // its cluster's end or a reset has passed does not start, so it makes none.
+                // The cluster's storage is there, its HDFS running, before its first step's container mounts it. A step
+                // a cancel, its cluster's end or a reset has passed does not start, so it makes none.
                 if (job.storage() != null && !progress.cancelled()) {
                     clusterStorage.create(launch.clusterId(), launch.accountId(), launch.region());
+                    running = running.onStorage(hdfs.get());
                 }
                 outcome = sparkRunner.run(running, progress);
             } catch (RuntimeException e) {
@@ -1638,16 +1648,30 @@ public class EmrService implements Resettable, StoredResourceArns {
         return "i-" + String.format("%017d", index);
     }
 
+    /** The private IPv4 address ListInstances gives a cluster's instance {@code index}, counted from 1. */
+    static String privateIpAddress(int index) {
+        return "10.0.0." + index;
+    }
+
     // The primary instance's: the first of the MASTER group in the order ListInstances lists them.
     static String masterInstanceId(EmrCluster cluster) {
+        return ec2InstanceId(masterInstanceIndex(cluster));
+    }
+
+    // The primary instance's private DNS name, as ListInstances gives it, which names the cluster's HDFS.
+    static String masterPrivateDnsName(EmrCluster cluster) {
+        return AwsRegions.ec2PrivateIpDnsName(privateIpAddress(masterInstanceIndex(cluster)), cluster.getRegion());
+    }
+
+    private static int masterInstanceIndex(EmrCluster cluster) {
         int index = 1;
         for (EmrInstanceGroup group : cluster.getInstanceGroups()) {
             if ("MASTER".equals(group.getInstanceGroupType())) {
-                return ec2InstanceId(index);
+                return index;
             }
             index += group.getRunningInstanceCount();
         }
-        return ec2InstanceId(1);
+        return 1;
     }
 
     /** What a step's thread asks the service while its driver goes: a step has no timeout to report. */

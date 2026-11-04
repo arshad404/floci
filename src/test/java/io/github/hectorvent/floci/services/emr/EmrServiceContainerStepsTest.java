@@ -19,6 +19,7 @@ import org.mockito.InOrder;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -100,7 +101,7 @@ class EmrServiceContainerStepsTest {
         assertNull(job.logFolder());
         assertNull(job.cloudWatchLogs());
         assertEquals(Map.of("PYSPARK_PYTHON", "/usr/bin/python3.11"), job.environment());
-        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
+        assertEquals(hdfsStorage(cluster), job.storage());
         assertEquals(List.of(cluster.getId()), fixture.clusterStorage.created);
     }
 
@@ -316,6 +317,37 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
+    void aStepStartsItsClustersHdfsOnItsPrimaryNodeFromTheReleasesHiveImage() {
+        EmrCluster requested = cluster("hdfs", true, sparkStep("report", "CONTINUE"));
+        // ListInstances lists the core group's two instances before the master's, the third.
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("CORE", 2), group("MASTER", 1))));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(Arrays.asList(cluster.getId(), "ip-10-0-0-3.ec2.internal",
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", null)), fixture.clusterStorage.hdfs);
+        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt",
+                "ip-10-0-0-3.ec2.internal", EmrServiceFixture.RecordingStorage.HDFS_ADDRESS),
+                runner.jobs.get(0).storage());
+    }
+
+    @Test
+    void aClustersHdfsThatCannotStartFailsTheStep() {
+        fixture.clusterStorage.hdfsFailure = new IllegalStateException(
+                "The HDFS of EMR cluster j-1 did not start within 120 seconds");
+        EmrCluster cluster = service.runJobFlow(cluster("no-hdfs", true, sparkStep("report", "CONTINUE")), REGION);
+
+        fixture.runStepThread();
+
+        EmrStep failed = service.describeStep(cluster.getId(), cluster.getSteps().get(0).getId());
+        assertEquals("FAILED", failed.getState());
+        assertEquals("The step could not start: The HDFS of EMR cluster j-1 did not start within 120 seconds",
+                failed.getFailureMessage());
+        assertEquals(List.of(), runner.jobs);
+    }
+
+    @Test
     void aStepFlociDoesNotRunFailsWithoutRunning() {
         EmrStep pig = sparkStep("query", "CONTINUE");
         pig.setArgs(List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/query.pig"));
@@ -342,7 +374,7 @@ class EmrServiceContainerStepsTest {
         assertEquals("COMPLETED", service.describeStep(cluster.getId(), cluster.getSteps().get(0).getId()).getState());
         SparkJobRunner.Job job = runner.jobs.get(0);
         assertEquals(args, job.command());
-        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
+        assertEquals(hdfsStorage(cluster), job.storage());
     }
 
     @Test
@@ -359,7 +391,7 @@ class EmrServiceContainerStepsTest {
         assertEquals(List.of("s3-dist-cp", "--src=s3://bucket/logs/", "--dest=hdfs:///output"),
                 job.command().subList(3, job.command().size()));
         assertEquals(List.of(), job.application());
-        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
+        assertEquals(hdfsStorage(cluster), job.storage());
     }
 
     @Test
@@ -640,7 +672,7 @@ class EmrServiceContainerStepsTest {
         // Its cluster's Spark settings are not Hive's.
         assertEquals(Map.of(), job.sparkDefaults());
         assertEquals(Map.of("HADOOP_HEAPSIZE", "2048"), job.environment());
-        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
+        assertEquals(hdfsStorage(cluster), job.storage());
         assertEquals("s3://logs/emr/" + cluster.getId() + "/steps/" + stepId + "/", job.logFolder());
         assertEquals(List.of(cluster.getId()), fixture.clusterStorage.created);
         assertEquals("COMPLETED", service.describeStep(cluster.getId(), stepId).getState());
@@ -852,8 +884,7 @@ class EmrServiceContainerStepsTest {
         assertTrue(service.describeCluster(cluster.getId()).isStorageCreated());
         fixture.runStepThread();
 
-        SparkJobRunner.Storage storage = new SparkJobRunner.Storage(cluster.getId() + "-home",
-                cluster.getId() + "-mnt");
+        SparkJobRunner.Storage storage = hdfsStorage(cluster);
         assertEquals(List.of(storage, storage), runner.jobs.stream().map(SparkJobRunner.Job::storage).toList());
         assertEquals(List.of(cluster.getId()), fixture.clusterStorage.removed);
         assertFalse(service.describeCluster(cluster.getId()).isStorageCreated());
@@ -986,6 +1017,12 @@ class EmrServiceContainerStepsTest {
     }
 
     // A spark-submit step through command-runner.jar, written for a cluster with YARN.
+    // A cluster's storage as a step gets it, its HDFS on the primary node of a cluster with no instance groups.
+    private static SparkJobRunner.Storage hdfsStorage(EmrCluster cluster) {
+        return new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt",
+                "ip-10-0-0-1.ec2.internal", EmrServiceFixture.RecordingStorage.HDFS_ADDRESS);
+    }
+
     // The AWS CLI's Hive step: command-runner.jar running hive-script with the step's arguments after its --args.
     private static EmrStep hiveStep(String name, String... args) {
         EmrStep step = new EmrStep();
